@@ -1,24 +1,30 @@
-import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native';
-import { Stack } from 'expo-router';
-import { StatusBar } from 'expo-status-bar';
 import 'react-native-reanimated';
 
-import { useColorScheme } from '@/hooks/use-color-scheme';
+import { Stack } from 'expo-router';
+import { StatusBar } from 'expo-status-bar';
+import { useEffect } from 'react';
 
-export const unstable_settings = {
-  anchor: '(tabs)',
-};
+import { initDb } from '@/lib/db';
 
 export default function RootLayout() {
-  const colorScheme = useColorScheme();
+  useEffect(() => {
+    initDb().catch((error) => {
+      console.warn('DB init failed', error);
+    });
+  }, []);
 
   return (
-    <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
-      <Stack>
-        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-        <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
+    <>
+      <Stack
+        screenOptions={{
+          headerTitleAlign: 'center',
+        }}
+      >
+        <Stack.Screen name="index" options={{ title: 'My Receipts' }} />
+        <Stack.Screen name="login" options={{ title: 'Sign In' }} />
+        <Stack.Screen name="add-receipt" options={{ title: 'Add Receipt' }} />
       </Stack>
       <StatusBar style="auto" />
-    </ThemeProvider>
+    </>
   );
 }

@@ -19,7 +19,11 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.RECORD_AUDIO"
+      ],
+      "package": "com.srikanth1986.receiptscanner"
     },
     "web": {
       "output": "static",
@@ -38,11 +42,25 @@
             "backgroundColor": "#000000"
           }
         }
+      ],
+      "expo-sqlite",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow access to your photo library to attach receipt images.",
+          "cameraPermission": "Allow access to your camera to capture receipt images."
+        }
       ]
     ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "23052cc5-e908-49b0-99e9-26f1c52b17d5"
+      }
     }
   }
 }
