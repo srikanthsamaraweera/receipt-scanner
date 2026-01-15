@@ -44,10 +44,11 @@ export async function initDb() {
       description_raw TEXT NOT NULL,
       qty REAL,
       unit_price REAL,
-      line_total REAL,
-      category TEXT
+      line_total REAL
     );
   `);
+
+  await migrateReceiptItemsSchema(db);
 }
 
 export type NewReceipt = Omit<Receipt, 'id' | 'created_at'> & {
@@ -94,18 +95,61 @@ export async function insertReceiptItem(item: NewReceiptItem): Promise<number> {
       description_raw,
       qty,
       unit_price,
-      line_total,
-      category
-    ) VALUES (?, ?, ?, ?, ?, ?)`,
+      line_total
+    ) VALUES (?, ?, ?, ?, ?)`,
     item.receipt_id,
     item.description_raw,
     item.qty ?? null,
     item.unit_price ?? null,
-    item.line_total ?? null,
-    item.category ?? null
+    item.line_total ?? null
   );
 
   return result.lastInsertRowId;
+}
+
+async function migrateReceiptItemsSchema(db: SQLite.SQLiteDatabase) {
+  const columns = await db.getAllAsync<{ name: string }>(
+    `PRAGMA table_info(receipt_items);`
+  );
+  if (columns.length === 0) {
+    return;
+  }
+
+  const hasCategory = columns.some((column) => column.name === 'category');
+  if (!hasCategory) {
+    return;
+  }
+
+  await db.execAsync(`
+    BEGIN;
+    CREATE TABLE IF NOT EXISTS receipt_items_new (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      receipt_id INTEGER NOT NULL,
+      description_raw TEXT NOT NULL,
+      qty REAL,
+      unit_price REAL,
+      line_total REAL
+    );
+    INSERT INTO receipt_items_new (
+      id,
+      receipt_id,
+      description_raw,
+      qty,
+      unit_price,
+      line_total
+    )
+    SELECT
+      id,
+      receipt_id,
+      description_raw,
+      qty,
+      unit_price,
+      line_total
+    FROM receipt_items;
+    DROP TABLE receipt_items;
+    ALTER TABLE receipt_items_new RENAME TO receipt_items;
+    COMMIT;
+  `);
 }
 
 export async function getReceipts(userId?: string): Promise<Receipt[]> {
@@ -121,6 +165,15 @@ export async function getReceipts(userId?: string): Promise<Receipt[]> {
   return db.getAllAsync<Receipt>(
     `SELECT * FROM receipts ORDER BY purchase_datetime DESC, id DESC`
   );
+}
+
+export async function getReceiptById(receiptId: number): Promise<Receipt | null> {
+  const db = await getDb();
+  const rows = await db.getAllAsync<Receipt>(
+    `SELECT * FROM receipts WHERE id = ? LIMIT 1`,
+    receiptId
+  );
+  return rows[0] ?? null;
 }
 
 export async function getReceiptItems(receiptId: number): Promise<ReceiptItem[]> {

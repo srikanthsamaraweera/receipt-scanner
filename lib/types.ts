@@ -18,5 +18,4 @@ export type ReceiptItem = {
   qty: number | null;
   unit_price: number | null;
   line_total: number | null;
-  category: string | null;
 };

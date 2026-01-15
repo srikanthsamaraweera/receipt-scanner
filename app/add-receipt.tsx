@@ -4,20 +4,29 @@ import { useHeaderHeight } from '@react-navigation/elements';
 import * as ImagePicker from 'expo-image-picker';
 
 import BrandingFooter from '@/components/branding-footer';
+import { insertReceipt, insertReceiptItem } from '@/lib/db';
 import { parseReceiptItems, runMlKitOcr, type ParsedReceiptItem } from '@/lib/receipt-ocr';
-import { parseReceiptItemsFromImageWithOpenAI, parseReceiptItemsWithOpenAI, type AiReceiptItem } from '@/lib/receipt-ai';
+import { parseReceiptItemsFromImageWithOpenAI, parseReceiptItemsWithOpenAI, type AiReceiptData, type AiReceiptItem } from '@/lib/receipt-ai';
 
 type EditableReceiptItem = {
   id: string;
   name: string;
   qty: string;
   price: string;
+  lineTotal: string;
 };
 
 export default function AddReceiptScreen() {
   const headerHeight = useHeaderHeight();
+  const [merchant, setMerchant] = useState('');
+  const [purchaseDateTime, setPurchaseDateTime] = useState('');
+  const [subtotal, setSubtotal] = useState('');
+  const [tax, setTax] = useState('');
+  const [total, setTotal] = useState('');
   const [photoUri, setPhotoUri] = useState<string | null>(null);
+  const [rawOcrText, setRawOcrText] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const [ocrError, setOcrError] = useState<string | null>(null);
   const [items, setItems] = useState<EditableReceiptItem[]>([]);
 
@@ -36,6 +45,7 @@ export default function AddReceiptScreen() {
         name: item.description,
         qty: inferredQty !== null ? String(inferredQty) : '',
         price: unitPrice !== null ? unitPrice.toFixed(2) : '',
+        lineTotal: item.lineTotal !== null ? item.lineTotal.toFixed(2) : '',
       };
     });
 
@@ -45,7 +55,35 @@ export default function AddReceiptScreen() {
       name: item.name,
       qty: item.qty !== null ? String(item.qty) : item.price !== null ? '1' : '',
       price: item.price !== null ? item.price.toFixed(2) : '',
+      lineTotal: item.line_total !== null ? item.line_total.toFixed(2) : '',
     }));
+
+  const applyReceiptFields = (receipt: AiReceiptData) => {
+    if (receipt.merchant) {
+      setMerchant(receipt.merchant);
+    }
+    if (receipt.purchase_datetime) {
+      setPurchaseDateTime(receipt.purchase_datetime);
+    }
+    if (receipt.subtotal !== null) {
+      setSubtotal(receipt.subtotal.toFixed(2));
+    }
+    if (receipt.tax !== null) {
+      setTax(receipt.tax.toFixed(2));
+    }
+    if (receipt.total !== null) {
+      setTotal(receipt.total.toFixed(2));
+    }
+  };
+
+  const hasReceiptFields = (receipt: AiReceiptData) =>
+    Boolean(
+      receipt.merchant ||
+        receipt.purchase_datetime ||
+        receipt.subtotal !== null ||
+        receipt.tax !== null ||
+        receipt.total !== null
+    );
 
   const updateItem = (id: string, updates: Partial<EditableReceiptItem>) => {
     setItems((prev) =>
@@ -56,7 +94,7 @@ export default function AddReceiptScreen() {
   const handleAddItem = () => {
     setItems((prev) => [
       ...prev,
-      { id: `${Date.now()}-${prev.length}`, name: '', qty: '', price: '' },
+      { id: `${Date.now()}-${prev.length}`, name: '', qty: '', price: '', lineTotal: '' },
     ]);
   };
 
@@ -85,6 +123,12 @@ export default function AddReceiptScreen() {
 
     setPhotoUri(asset.uri);
     setItems([]);
+    setRawOcrText(null);
+    setMerchant('');
+    setPurchaseDateTime('');
+    setSubtotal('');
+    setTax('');
+    setTotal('');
 
     setIsProcessing(true);
     try {
@@ -95,9 +139,12 @@ export default function AddReceiptScreen() {
 
       if (openAiKey && asset.base64) {
         try {
-          const aiItems = await parseReceiptItemsFromImageWithOpenAI(asset.base64, openAiKey);
-          if (aiItems.length > 0) {
-            nextItems = createEditableItemsFromAi(aiItems);
+          const aiData = await parseReceiptItemsFromImageWithOpenAI(asset.base64, openAiKey);
+          if (aiData.items.length > 0) {
+            nextItems = createEditableItemsFromAi(aiData.items);
+          }
+          if (hasReceiptFields(aiData)) {
+            applyReceiptFields(aiData);
           } else {
             aiNotice = 'AI parsing returned no items. Falling back to OCR text.';
           }
@@ -113,12 +160,16 @@ export default function AddReceiptScreen() {
 
       if (nextItems.length === 0) {
         rawText = await runMlKitOcr(asset.uri);
+        setRawOcrText(rawText);
         nextItems = createEditableItemsFromParsed(parseReceiptItems(rawText));
         if (openAiKey && rawText) {
           try {
-            const aiItems = await parseReceiptItemsWithOpenAI(rawText, openAiKey);
-            if (aiItems.length > 0) {
-              nextItems = createEditableItemsFromAi(aiItems);
+            const aiData = await parseReceiptItemsWithOpenAI(rawText, openAiKey);
+            if (aiData.items.length > 0) {
+              nextItems = createEditableItemsFromAi(aiData.items);
+            }
+            if (hasReceiptFields(aiData)) {
+              applyReceiptFields(aiData);
             } else if (!aiNotice) {
               aiNotice = 'AI parsing returned no items. Showing best-effort results.';
             }
@@ -148,8 +199,81 @@ export default function AddReceiptScreen() {
     }
   };
 
-  const handleSave = () => {
-    Alert.alert('Save Receipt', 'Saving will be added later.');
+  const parseOptionalNumber = (value: string): number | null => {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    const parsed = Number.parseFloat(trimmed);
+    return Number.isNaN(parsed) ? null : parsed;
+  };
+
+  const handleSave = async () => {
+    if (isSaving || isProcessing) {
+      return;
+    }
+
+    const merchantValue = merchant.trim();
+    const purchaseValue = purchaseDateTime.trim();
+    if (!merchantValue) {
+      Alert.alert('Missing merchant', 'Please enter the merchant name before saving.');
+      return;
+    }
+    if (!purchaseValue) {
+      Alert.alert('Missing date', 'Please enter the purchase date and time.');
+      return;
+    }
+
+    const filteredItems = items.filter((item) => item.name.trim().length > 0);
+    if (filteredItems.length === 0) {
+      Alert.alert('No items', 'Add at least one item before saving.');
+      return;
+    }
+
+    setIsSaving(true);
+    try {
+      const receiptId = await insertReceipt({
+        user_id: null,
+        merchant_name: merchantValue,
+        purchase_datetime: purchaseValue,
+        subtotal: parseOptionalNumber(subtotal),
+        tax: parseOptionalNumber(tax),
+        total: parseOptionalNumber(total),
+        image_uri: photoUri,
+        raw_ocr_text: rawOcrText,
+      });
+
+      await Promise.all(
+        filteredItems.map((item) => {
+          const qtyValue = parseOptionalNumber(item.qty);
+          const unitPriceValue = parseOptionalNumber(item.price);
+          let lineTotalValue = parseOptionalNumber(item.lineTotal);
+
+          if (lineTotalValue === null && qtyValue !== null && unitPriceValue !== null) {
+            lineTotalValue = Number.parseFloat((qtyValue * unitPriceValue).toFixed(2));
+          }
+
+          const finalUnitPrice =
+            unitPriceValue ??
+            (lineTotalValue !== null && qtyValue ? lineTotalValue / qtyValue : null);
+
+          return insertReceiptItem({
+            receipt_id: receiptId,
+            description_raw: item.name.trim(),
+            qty: qtyValue,
+            unit_price: finalUnitPrice !== null ? Number.parseFloat(finalUnitPrice.toFixed(2)) : null,
+            line_total: lineTotalValue,
+          });
+        })
+      );
+
+      Alert.alert('Receipt saved', 'Your receipt has been saved locally.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to save receipt.';
+      Alert.alert('Save failed', message);
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   return (
@@ -171,6 +295,8 @@ export default function AddReceiptScreen() {
           style={styles.input}
           placeholder="Coffee Shop"
           placeholderTextColor="#6B7280"
+          value={merchant}
+          onChangeText={setMerchant}
         />
       </View>
 
@@ -180,6 +306,8 @@ export default function AddReceiptScreen() {
           style={styles.input}
           placeholder="2025-01-14 13:45"
           placeholderTextColor="#6B7280"
+          value={purchaseDateTime}
+          onChangeText={setPurchaseDateTime}
         />
       </View>
 
@@ -190,6 +318,8 @@ export default function AddReceiptScreen() {
           placeholder="0.00"
           placeholderTextColor="#6B7280"
           keyboardType="numeric"
+          value={subtotal}
+          onChangeText={setSubtotal}
         />
       </View>
 
@@ -200,6 +330,8 @@ export default function AddReceiptScreen() {
           placeholder="0.00"
           placeholderTextColor="#6B7280"
           keyboardType="numeric"
+          value={tax}
+          onChangeText={setTax}
         />
       </View>
 
@@ -210,6 +342,8 @@ export default function AddReceiptScreen() {
           placeholder="0.00"
           placeholderTextColor="#6B7280"
           keyboardType="numeric"
+          value={total}
+          onChangeText={setTotal}
         />
       </View>
 
@@ -247,6 +381,9 @@ export default function AddReceiptScreen() {
                 <Text style={[styles.tableCell, styles.tableHeaderCell, styles.tableCellPrice]}>
                   Unit Price
                 </Text>
+                <Text style={[styles.tableCell, styles.tableHeaderCell, styles.tableCellLineTotal]}>
+                  Line Total
+                </Text>
               </View>
               {items.map((item) => (
                 <View key={item.id} style={styles.tableRow}>
@@ -273,6 +410,14 @@ export default function AddReceiptScreen() {
                     placeholderTextColor="#9CA3AF"
                     keyboardType="decimal-pad"
                   />
+                  <TextInput
+                    style={[styles.tableCell, styles.tableCellLineTotal]}
+                    value={item.lineTotal}
+                    onChangeText={(value) => updateItem(item.id, { lineTotal: value })}
+                    placeholder="0.00"
+                    placeholderTextColor="#9CA3AF"
+                    keyboardType="decimal-pad"
+                  />
                 </View>
               ))}
             </View>
@@ -286,9 +431,9 @@ export default function AddReceiptScreen() {
         </Pressable>
       </View>
 
-        <Pressable style={styles.primaryButton} onPress={handleSave}>
-          <Text style={styles.primaryButtonText}>Save Receipt</Text>
-        </Pressable>
+      <Pressable style={styles.primaryButton} onPress={handleSave}>
+        <Text style={styles.primaryButtonText}>Save Receipt</Text>
+      </Pressable>
 
         <BrandingFooter />
       </ScrollView>
@@ -402,13 +547,17 @@ const styles = StyleSheet.create({
     color: '#374151',
   },
   tableCellName: {
-    flex: 2.2,
+    flex: 2,
   },
   tableCellQty: {
     flex: 1,
     textAlign: 'right',
   },
   tableCellPrice: {
+    flex: 1.1,
+    textAlign: 'right',
+  },
+  tableCellLineTotal: {
     flex: 1.2,
     textAlign: 'right',
     borderRightWidth: 0,

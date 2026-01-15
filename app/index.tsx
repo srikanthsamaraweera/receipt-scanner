@@ -1,18 +1,41 @@
 import { Link } from 'expo-router';
-import { FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
+import { useCallback, useState } from 'react';
+import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
 
 import BrandingFooter from '@/components/branding-footer';
-
-type ReceiptPreview = {
-  id: number;
-  merchant_name: string;
-  purchase_datetime: string;
-  total: number;
-};
-
-const sampleReceipts: ReceiptPreview[] = [];
+import { getReceipts } from '@/lib/db';
+import type { Receipt } from '@/lib/types';
 
 export default function HomeScreen() {
+  const [receipts, setReceipts] = useState<Receipt[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+
+  useFocusEffect(
+    useCallback(() => {
+      let isActive = true;
+      setIsLoading(true);
+      getReceipts()
+        .then((data) => {
+          if (isActive) {
+            setReceipts(data);
+          }
+        })
+        .catch((error) => {
+          console.warn('Failed to load receipts', error);
+        })
+        .finally(() => {
+          if (isActive) {
+            setIsLoading(false);
+          }
+        });
+
+      return () => {
+        isActive = false;
+      };
+    }, [])
+  );
+
   return (
     <View style={styles.container}>
       <View style={styles.header}>
@@ -33,27 +56,41 @@ export default function HomeScreen() {
         </Link>
       </View>
 
-      <FlatList
-        data={sampleReceipts}
-        keyExtractor={(item) => String(item.id)}
-        contentContainerStyle={styles.listContent}
-        renderItem={({ item }) => (
-          <View style={styles.card}>
-            <View style={styles.cardRow}>
-              <Text style={styles.cardTitle}>{item.merchant_name}</Text>
-              <Text style={styles.cardTotal}>${item.total.toFixed(2)}</Text>
+      {isLoading ? (
+        <View style={styles.loadingState}>
+          <ActivityIndicator size="small" color="#0F766E" />
+          <Text style={styles.loadingText}>Loading receipts...</Text>
+        </View>
+      ) : (
+        <FlatList
+          data={receipts}
+          keyExtractor={(item) => String(item.id)}
+          contentContainerStyle={styles.listContent}
+          renderItem={({ item }) => {
+            const displayTotal = item.total ?? item.subtotal;
+            return (
+              <Link href={`/receipt/${item.id}`} asChild>
+                <Pressable style={styles.card} accessibilityRole="button">
+                  <View style={styles.cardRow}>
+                    <Text style={styles.cardTitle}>{item.merchant_name}</Text>
+                    <Text style={styles.cardTotal}>
+                      {displayTotal !== null ? `$${displayTotal.toFixed(2)}` : '--'}
+                    </Text>
+                  </View>
+                  <Text style={styles.cardSub}>{item.purchase_datetime}</Text>
+                </Pressable>
+              </Link>
+            );
+          }}
+          ListEmptyComponent={
+            <View style={styles.emptyState}>
+              <Text style={styles.emptyTitle}>No receipts yet</Text>
+              <Text style={styles.emptyText}>Tap Add Receipt to create your first entry.</Text>
             </View>
-            <Text style={styles.cardSub}>{item.purchase_datetime}</Text>
-          </View>
-        )}
-        ListEmptyComponent={
-          <View style={styles.emptyState}>
-            <Text style={styles.emptyTitle}>No receipts yet</Text>
-            <Text style={styles.emptyText}>Tap Add Receipt to create your first entry.</Text>
-          </View>
-        }
-        ListFooterComponent={<BrandingFooter />}
-      />
+          }
+          ListFooterComponent={<BrandingFooter />}
+        />
+      )}
     </View>
   );
 }
@@ -108,6 +145,15 @@ const styles = StyleSheet.create({
   listContent: {
     flexGrow: 1,
     paddingBottom: 24,
+  },
+  loadingState: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  loadingText: {
+    marginTop: 10,
+    color: '#6B7280',
   },
   card: {
     backgroundColor: '#FFFFFF',
