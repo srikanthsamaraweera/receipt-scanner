@@ -2,6 +2,16 @@ export type AiReceiptItem = {
   name: string;
   qty: number | null;
   price: number | null;
+  line_total: number | null;
+};
+
+export type AiReceiptData = {
+  items: AiReceiptItem[];
+  merchant: string | null;
+  purchase_datetime: string | null;
+  subtotal: number | null;
+  tax: number | null;
+  total: number | null;
 };
 
 type OpenAiChatResponse = {
@@ -26,12 +36,18 @@ const RECEIPT_SCHEMA = {
           name: { type: 'string' },
           qty: { type: ['number', 'null'] },
           price: { type: ['number', 'null'] },
+          line_total: { type: ['number', 'null'] },
         },
-        required: ['name', 'qty', 'price'],
+        required: ['name', 'qty', 'price', 'line_total'],
       },
     },
+    merchant: { type: ['string', 'null'] },
+    purchase_datetime: { type: ['string', 'null'] },
+    subtotal: { type: ['number', 'null'] },
+    tax: { type: ['number', 'null'] },
+    total: { type: ['number', 'null'] },
   },
-  required: ['items'],
+  required: ['items', 'merchant', 'purchase_datetime', 'subtotal', 'tax', 'total'],
 } as const;
 
 function normalizeAiItem(item: AiReceiptItem): AiReceiptItem {
@@ -39,29 +55,65 @@ function normalizeAiItem(item: AiReceiptItem): AiReceiptItem {
     name: typeof item.name === 'string' ? item.name.trim() : '',
     qty: typeof item.qty === 'number' && Number.isFinite(item.qty) ? item.qty : null,
     price: typeof item.price === 'number' && Number.isFinite(item.price) ? item.price : null,
+    line_total:
+      typeof item.line_total === 'number' && Number.isFinite(item.line_total)
+        ? item.line_total
+        : null,
   };
 }
 
-function parseItemsFromContent(content: string): AiReceiptItem[] {
+function normalizeAiReceiptData(data: AiReceiptData): AiReceiptData {
+  return {
+    items: Array.isArray(data.items)
+      ? data.items.map(normalizeAiItem).filter((item) => item.name.length > 0)
+      : [],
+    merchant:
+      typeof data.merchant === 'string' && data.merchant.trim().length > 0
+        ? data.merchant.trim()
+        : null,
+    purchase_datetime:
+      typeof data.purchase_datetime === 'string' &&
+      data.purchase_datetime.trim().length > 0
+        ? data.purchase_datetime.trim()
+        : null,
+    subtotal:
+      typeof data.subtotal === 'number' && Number.isFinite(data.subtotal)
+        ? data.subtotal
+        : null,
+    tax: typeof data.tax === 'number' && Number.isFinite(data.tax) ? data.tax : null,
+    total:
+      typeof data.total === 'number' && Number.isFinite(data.total) ? data.total : null,
+  };
+}
+
+function emptyReceiptData(): AiReceiptData {
+  return {
+    items: [],
+    merchant: null,
+    purchase_datetime: null,
+    subtotal: null,
+    tax: null,
+    total: null,
+  };
+}
+
+function parseReceiptDataFromContent(content: string): AiReceiptData {
   if (!content) {
-    return [];
+    return emptyReceiptData();
   }
 
   try {
-    const parsed = JSON.parse(content) as { items?: AiReceiptItem[] };
-    if (!Array.isArray(parsed.items)) {
-      return [];
-    }
-    return parsed.items.map(normalizeAiItem).filter((item) => item.name.length > 0);
+    const parsed = JSON.parse(content) as AiReceiptData;
+    return normalizeAiReceiptData(parsed);
   } catch {
-    return [];
+    return emptyReceiptData();
   }
 }
 
 export async function parseReceiptItemsWithOpenAI(
   rawText: string,
   apiKey: string
-): Promise<AiReceiptItem[]> {
+): Promise<AiReceiptData> {
   const response = await fetch(OPENAI_API_URL, {
     method: 'POST',
     headers: {
@@ -82,11 +134,21 @@ export async function parseReceiptItemsWithOpenAI(
         {
           role: 'system',
           content:
-            'You extract receipt line items from Canadian grocery receipts. Return only purchasable items, excluding totals, taxes, loyalty, coupons, and payment lines. Price must be the unit price (per item). Ignore tax codes, item codes, and category headers.',
+            'You extract receipt line items and totals from Canadian grocery receipts. Return only purchasable items, excluding totals, taxes, loyalty, coupons, and payment lines. Price must be the unit price (per item) and line_total is the final amount charged for the line. Ignore tax codes, item codes, and category headers. Be precise with quantities and unit prices, especially for weighted items.',
         },
         {
           role: 'user',
-          content: `The receipt is from a Canadian grocery store (No Frills, Costco, Walmart, Giant Tiger) or a Chinese market (Al Premium, Scarborough), or a small local grocer. Extract items with name, quantity, and unit price (per item) from this receipt text. If quantity is missing, assume 1. If only a line total is present and quantity > 1, compute unit price. Lines for a single item may be split across two rows; merge them. Ignore tax codes, item codes, and category headers.\n\n${rawText}`,
+          content: `The receipt is from a Canadian grocery store (No Frills, Costco, Walmart, Giant Tiger) or a Chinese market (Al Premium, Scarborough), or a small local grocer. Extract items with name, quantity, unit price (per item), and line total (final amount charged) from this receipt text. Lines for a single item may be split across two rows; merge them. Ignore tax codes, item codes, and category headers.
+
+Quantity/unit-price rules (think like a shopper):
+- Weighted items: if you see weight like "0.78 kg" or "0.335kg", quantity is that weight. If you see "@ 2.16/kg", unit price is 2.16 (per kg). If a line total is shown (e.g., 0.72), do not use it as unit price.
+- Multi-quantity items: if you see "2 @ 1.50" or "2x 1.50", quantity is 2 and unit price is 1.50.
+- If a line total is present and quantity > 1 or quantity is a weight but unit price is missing, compute unit price = line total / quantity (round to 2 decimals).
+- If no quantity is present, assume quantity = 1 and unit price = the single price shown. Line total should still be the final amount charged for that line.
+
+Also extract merchant name, purchase date/time, subtotal, tax, and total when present. If a field is missing, return null.
+
+${rawText}`,
         },
       ],
       temperature: 0,
@@ -99,13 +161,13 @@ export async function parseReceiptItemsWithOpenAI(
   }
 
   const data = (await response.json()) as OpenAiChatResponse;
-  return parseItemsFromContent(data.choices?.[0]?.message?.content ?? '');
+  return parseReceiptDataFromContent(data.choices?.[0]?.message?.content ?? '');
 }
 
 export async function parseReceiptItemsFromImageWithOpenAI(
   base64Image: string,
   apiKey: string
-): Promise<AiReceiptItem[]> {
+): Promise<AiReceiptData> {
   const response = await fetch(OPENAI_API_URL, {
     method: 'POST',
     headers: {
@@ -126,7 +188,7 @@ export async function parseReceiptItemsFromImageWithOpenAI(
         {
           role: 'system',
           content:
-            'You extract receipt line items from Canadian grocery receipt images. Return only purchasable items, excluding totals, taxes, loyalty, coupons, and payment lines. Price must be the unit price (per item). Ignore tax codes, item codes, and category headers.',
+            'You extract receipt line items and totals from Canadian grocery receipt images. Return only purchasable items, excluding totals, taxes, loyalty, coupons, and payment lines. Price must be the unit price (per item) and line_total is the final amount charged for the line. Ignore tax codes, item codes, and category headers. Be precise with quantities and unit prices, especially for weighted items.',
         },
         {
           role: 'user',
@@ -134,7 +196,7 @@ export async function parseReceiptItemsFromImageWithOpenAI(
             {
               type: 'text',
               text:
-                'The receipt is from a Canadian grocery store (No Frills, Costco, Walmart, Giant Tiger) or a Chinese market (Al Premium, Scarborough), or a small local grocer. Extract items with name, quantity, and unit price (per item). If quantity is missing, assume 1. If only a line total is present and quantity > 1, compute unit price. Lines for a single item may be split across two rows; merge them. Ignore tax codes, item codes, and category headers.',
+                'The receipt is from a Canadian grocery store (No Frills, Costco, Walmart, Giant Tiger) or a Chinese market (Al Premium, Scarborough), or a small local grocer. Extract items with name, quantity, unit price (per item), and line total (final amount charged). Lines for a single item may be split across two rows; merge them. Ignore tax codes, item codes, and category headers.\n\nQuantity/unit-price rules (think like a shopper):\n- Weighted items: if you see weight like "0.78 kg" or "0.335kg", quantity is that weight. If you see "@ 2.16/kg", unit price is 2.16 (per kg). If a line total is shown (e.g., 0.72), do not use it as unit price.\n- Multi-quantity items: if you see "2 @ 1.50" or "2x 1.50", quantity is 2 and unit price is 1.50.\n- If a line total is present and quantity > 1 or quantity is a weight but unit price is missing, compute unit price = line total / quantity (round to 2 decimals).\n- If no quantity is present, assume quantity = 1 and unit price = the single price shown. Line total should still be the final amount charged for that line.\n\nAlso extract merchant name, purchase date/time, subtotal, tax, and total when present. If a field is missing, return null.',
             },
             {
               type: 'image_url',
@@ -155,5 +217,5 @@ export async function parseReceiptItemsFromImageWithOpenAI(
   }
 
   const data = (await response.json()) as OpenAiChatResponse;
-  return parseItemsFromContent(data.choices?.[0]?.message?.content ?? '');
+  return parseReceiptDataFromContent(data.choices?.[0]?.message?.content ?? '');
 }

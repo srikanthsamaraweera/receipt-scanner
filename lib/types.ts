@@ -8,6 +8,7 @@ export type Receipt = {
   total: number | null;
   image_uri: string | null;
   raw_ocr_text: string | null;
+  dedupe_key: string | null;
   created_at: string;
 };
 
@@ -18,5 +19,4 @@ export type ReceiptItem = {
   qty: number | null;
   unit_price: number | null;
   line_total: number | null;
-  category: string | null;
 };
