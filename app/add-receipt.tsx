@@ -1,10 +1,12 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ActivityIndicator, Alert, Image, KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useHeaderHeight } from '@react-navigation/elements';
 import * as ImagePicker from 'expo-image-picker';
+import { useRouter } from 'expo-router';
 
 import BrandingFooter from '@/components/branding-footer';
-import { insertReceipt, insertReceiptItem } from '@/lib/db';
+import { hasPossibleDuplicateReceipt, insertReceipt, insertReceiptItem } from '@/lib/db';
+import { normalizeReceiptDateTimeFromScan } from '@/lib/date';
 import { parseReceiptItems, runMlKitOcr, type ParsedReceiptItem } from '@/lib/receipt-ocr';
 import { parseReceiptItemsFromImageWithOpenAI, parseReceiptItemsWithOpenAI, type AiReceiptData, type AiReceiptItem } from '@/lib/receipt-ai';
 
@@ -17,9 +19,12 @@ type EditableReceiptItem = {
 };
 
 export default function AddReceiptScreen() {
+  const router = useRouter();
   const headerHeight = useHeaderHeight();
   const [merchant, setMerchant] = useState('');
   const [purchaseDateTime, setPurchaseDateTime] = useState('');
+  const [purchaseDateWarning, setPurchaseDateWarning] = useState(false);
+  const [purchaseDateAcknowledged, setPurchaseDateAcknowledged] = useState(false);
   const [subtotal, setSubtotal] = useState('');
   const [tax, setTax] = useState('');
   const [total, setTotal] = useState('');
@@ -63,7 +68,8 @@ export default function AddReceiptScreen() {
       setMerchant(receipt.merchant);
     }
     if (receipt.purchase_datetime) {
-      setPurchaseDateTime(receipt.purchase_datetime);
+      const normalized = normalizeReceiptDateTimeFromScan(receipt.purchase_datetime);
+      setPurchaseDateTime(normalized ?? receipt.purchase_datetime);
     }
     if (receipt.subtotal !== null) {
       setSubtotal(receipt.subtotal.toFixed(2));
@@ -126,6 +132,8 @@ export default function AddReceiptScreen() {
     setRawOcrText(null);
     setMerchant('');
     setPurchaseDateTime('');
+    setPurchaseDateWarning(false);
+    setPurchaseDateAcknowledged(false);
     setSubtotal('');
     setTax('');
     setTotal('');
@@ -208,8 +216,55 @@ export default function AddReceiptScreen() {
     return Number.isNaN(parsed) ? null : parsed;
   };
 
-  const handleSave = async () => {
+  useEffect(() => {
+    const trimmed = purchaseDateTime.trim();
+    if (!trimmed) {
+      setPurchaseDateWarning(false);
+      return;
+    }
+
+    const normalized = normalizeReceiptDateTimeFromScan(trimmed);
+    if (!normalized) {
+      setPurchaseDateWarning(false);
+      return;
+    }
+
+    let isActive = true;
+    const timeout = setTimeout(() => {
+      hasPossibleDuplicateReceipt(normalized, null)
+        .then((hasDuplicate) => {
+          if (isActive) {
+          setPurchaseDateWarning(hasDuplicate);
+        }
+      })
+        .catch(() => {
+          if (isActive) {
+            setPurchaseDateWarning(false);
+          }
+        });
+    }, 300);
+
+    return () => {
+      isActive = false;
+      clearTimeout(timeout);
+    };
+  }, [purchaseDateTime]);
+
+  useEffect(() => {
+    if (!purchaseDateWarning) {
+      setPurchaseDateAcknowledged(false);
+    }
+  }, [purchaseDateWarning]);
+
+  const handleSave = async (forceDuplicate = false) => {
     if (isSaving || isProcessing) {
+      return;
+    }
+    if (purchaseDateWarning && !purchaseDateAcknowledged) {
+      Alert.alert(
+        'Duplicate warning',
+        'Please acknowledge the duplicate warning before saving.'
+      );
       return;
     }
 
@@ -223,6 +278,41 @@ export default function AddReceiptScreen() {
       Alert.alert('Missing date', 'Please enter the purchase date and time.');
       return;
     }
+    const normalizedPurchaseDate = normalizeReceiptDateTimeFromScan(purchaseValue);
+    if (!normalizedPurchaseDate) {
+      Alert.alert(
+        'Invalid date',
+        'Enter a valid date like YYYY-MM-DD or DD/MM/YY with optional time.'
+      );
+      return;
+    }
+
+    const subtotalValue = parseOptionalNumber(subtotal);
+    const taxValue = parseOptionalNumber(tax);
+    const totalValue = parseOptionalNumber(total);
+    const computedTotal =
+      totalValue ?? (subtotalValue !== null && taxValue !== null ? subtotalValue + taxValue : null);
+
+    if (!forceDuplicate) {
+      const hasDuplicate = await hasPossibleDuplicateReceipt(
+        normalizedPurchaseDate,
+        computedTotal
+      );
+      if (hasDuplicate) {
+        Alert.alert(
+          'Possible duplicate',
+          'A receipt with the same purchase date/time and total already exists. Save anyway?',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            {
+              text: 'Save anyway',
+              onPress: () => handleSave(true),
+            },
+          ]
+        );
+        return;
+      }
+    }
 
     const filteredItems = items.filter((item) => item.name.trim().length > 0);
     if (filteredItems.length === 0) {
@@ -232,16 +322,19 @@ export default function AddReceiptScreen() {
 
     setIsSaving(true);
     try {
-      const receiptId = await insertReceipt({
-        user_id: null,
-        merchant_name: merchantValue,
-        purchase_datetime: purchaseValue,
-        subtotal: parseOptionalNumber(subtotal),
-        tax: parseOptionalNumber(tax),
-        total: parseOptionalNumber(total),
-        image_uri: photoUri,
-        raw_ocr_text: rawOcrText,
-      });
+      const receiptId = await insertReceipt(
+        {
+          user_id: null,
+          merchant_name: merchantValue,
+          purchase_datetime: normalizedPurchaseDate,
+          subtotal: subtotalValue,
+          tax: taxValue,
+          total: totalValue ?? computedTotal,
+          image_uri: photoUri,
+          raw_ocr_text: rawOcrText,
+        },
+        { allowDuplicate: forceDuplicate }
+      );
 
       await Promise.all(
         filteredItems.map((item) => {
@@ -267,9 +360,29 @@ export default function AddReceiptScreen() {
         })
       );
 
-      Alert.alert('Receipt saved', 'Your receipt has been saved locally.');
+      Alert.alert('Receipt saved', 'Your receipt has been saved locally.', [
+        {
+          text: 'OK',
+          onPress: () => router.back(),
+        },
+      ]);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to save receipt.';
+      if (!forceDuplicate && message.includes('dedupe_key')) {
+        setIsSaving(false);
+        Alert.alert(
+          'Possible duplicate',
+          'A receipt with the same purchase date/time and total already exists. Save anyway?',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            {
+              text: 'Save anyway',
+              onPress: () => handleSave(true),
+            },
+          ]
+        );
+        return;
+      }
       Alert.alert('Save failed', message);
     } finally {
       setIsSaving(false);
@@ -303,7 +416,7 @@ export default function AddReceiptScreen() {
       <View style={styles.section}>
         <Text style={styles.label}>Purchase date and time</Text>
         <TextInput
-          style={styles.input}
+          style={[styles.input, purchaseDateWarning && styles.inputWarning]}
           placeholder="2025-01-14 13:45"
           placeholderTextColor="#6B7280"
           value={purchaseDateTime}
@@ -431,8 +544,43 @@ export default function AddReceiptScreen() {
         </Pressable>
       </View>
 
-      <Pressable style={styles.primaryButton} onPress={handleSave}>
-        <Text style={styles.primaryButtonText}>Save Receipt</Text>
+      {purchaseDateWarning ? (
+        <View style={styles.warningCard}>
+          <Text style={styles.warningTitle}>Possible duplicate receipt</Text>
+          <Text style={styles.warningText}>
+            A receipt with this purchase date/time already exists. Confirm before saving.
+          </Text>
+          <Pressable
+            style={styles.warningCheckboxRow}
+            onPress={() => setPurchaseDateAcknowledged((prev) => !prev)}
+          >
+            <View
+              style={[
+                styles.warningCheckbox,
+                purchaseDateAcknowledged && styles.warningCheckboxChecked,
+              ]}
+            >
+              {purchaseDateAcknowledged ? (
+                <Text style={styles.warningCheckboxMark}>✓</Text>
+              ) : null}
+            </View>
+            <Text style={styles.warningCheckboxLabel}>I acknowledge this may be a duplicate</Text>
+          </Pressable>
+        </View>
+      ) : null}
+
+      <Pressable
+        style={[
+          styles.primaryButton,
+          (isSaving || (purchaseDateWarning && !purchaseDateAcknowledged)) &&
+            styles.primaryButtonDisabled,
+        ]}
+        onPress={handleSave}
+        disabled={isSaving || (purchaseDateWarning && !purchaseDateAcknowledged)}
+      >
+        <Text style={styles.primaryButtonText}>
+          {isSaving ? 'Saving...' : 'Save Receipt'}
+        </Text>
       </Pressable>
 
         <BrandingFooter />
@@ -474,6 +622,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 10,
     color: '#111827',
+  },
+  inputWarning: {
+    borderColor: '#F59E0B',
   },
   outlineButton: {
     borderWidth: 1,
@@ -590,9 +741,58 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     alignItems: 'center',
   },
+  primaryButtonDisabled: {
+    opacity: 0.7,
+  },
   primaryButtonText: {
     color: '#F9FAFB',
     fontWeight: '600',
     fontSize: 16,
+  },
+  warningCard: {
+    marginTop: 4,
+    marginBottom: 10,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: '#F59E0B',
+    backgroundColor: '#FFFBEB',
+    borderRadius: 10,
+  },
+  warningTitle: {
+    fontWeight: '700',
+    color: '#92400E',
+    marginBottom: 4,
+  },
+  warningText: {
+    color: '#92400E',
+    marginBottom: 8,
+  },
+  warningCheckboxRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  warningCheckbox: {
+    width: 18,
+    height: 18,
+    borderRadius: 4,
+    borderWidth: 1,
+    borderColor: '#D97706',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#FFFFFF',
+  },
+  warningCheckboxChecked: {
+    backgroundColor: '#F59E0B',
+    borderColor: '#F59E0B',
+  },
+  warningCheckboxMark: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  warningCheckboxLabel: {
+    color: '#92400E',
+    fontWeight: '600',
   },
 });

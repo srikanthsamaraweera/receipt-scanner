@@ -1,5 +1,6 @@
 import * as SQLite from 'expo-sqlite';
 
+import { parseFlexibleDateTime } from './date';
 import { Receipt, ReceiptItem } from './types';
 
 let dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
@@ -35,6 +36,7 @@ export async function initDb() {
       total REAL,
       image_uri TEXT,
       raw_ocr_text TEXT,
+      dedupe_key TEXT,
       created_at TEXT NOT NULL
     );
 
@@ -48,6 +50,7 @@ export async function initDb() {
     );
   `);
 
+  await migrateReceiptsSchema(db);
   await migrateReceiptItemsSchema(db);
 }
 
@@ -57,9 +60,15 @@ export type NewReceipt = Omit<Receipt, 'id' | 'created_at'> & {
 
 export type NewReceiptItem = Omit<ReceiptItem, 'id'>;
 
-export async function insertReceipt(receipt: NewReceipt): Promise<number> {
+export async function insertReceipt(
+  receipt: NewReceipt,
+  options?: { allowDuplicate?: boolean }
+): Promise<number> {
   const db = await getDb();
   const createdAt = receipt.created_at ?? new Date().toISOString();
+  const dedupeKey = options?.allowDuplicate
+    ? null
+    : createReceiptDedupeKey(receipt.purchase_datetime, receipt.total);
 
   const result = await db.runAsync(
     `INSERT INTO receipts (
@@ -71,8 +80,9 @@ export async function insertReceipt(receipt: NewReceipt): Promise<number> {
       total,
       image_uri,
       raw_ocr_text,
+      dedupe_key,
       created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     receipt.user_id ?? null,
     receipt.merchant_name,
     receipt.purchase_datetime,
@@ -81,6 +91,7 @@ export async function insertReceipt(receipt: NewReceipt): Promise<number> {
     receipt.total ?? null,
     receipt.image_uri ?? null,
     receipt.raw_ocr_text ?? null,
+    dedupeKey,
     createdAt
   );
 
@@ -183,4 +194,222 @@ export async function getReceiptItems(receiptId: number): Promise<ReceiptItem[]>
     `SELECT * FROM receipt_items WHERE receipt_id = ? ORDER BY id ASC`,
     receiptId
   );
+}
+
+function createReceiptDedupeKey(
+  purchaseDateTime: string,
+  total: number | null
+): string | null {
+  if (!purchaseDateTime) {
+    return null;
+  }
+  if (total === null) {
+    return purchaseDateTime;
+  }
+  return `${purchaseDateTime}|${total.toFixed(2)}`;
+}
+
+async function migrateReceiptsSchema(db: SQLite.SQLiteDatabase) {
+  const columns = await db.getAllAsync<{ name: string }>(`PRAGMA table_info(receipts);`);
+  if (columns.length === 0) {
+    return;
+  }
+
+  const hasDedupeKey = columns.some((column) => column.name === 'dedupe_key');
+  if (!hasDedupeKey) {
+    await db.execAsync(`ALTER TABLE receipts ADD COLUMN dedupe_key TEXT;`);
+  }
+
+  await db.execAsync(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_dedupe_key
+     ON receipts(dedupe_key)
+     WHERE dedupe_key IS NOT NULL;`
+  );
+}
+
+export async function hasReceiptWithPurchaseDate(
+  purchaseDateTime: string,
+  total: number | null,
+  toleranceMs = 60000
+): Promise<boolean> {
+  const db = await getDb();
+  const roundedTotal = total !== null ? Number.parseFloat(total.toFixed(2)) : null;
+
+  const exactRows = await db.getAllAsync<{
+    purchase_datetime: string;
+    total: number | null;
+    subtotal: number | null;
+    tax: number | null;
+  }>(
+    `SELECT purchase_datetime, total, subtotal, tax
+     FROM receipts
+     WHERE purchase_datetime = ?`,
+    purchaseDateTime
+  );
+
+  if (exactRows.length > 0) {
+    if (roundedTotal === null) {
+      return true;
+    }
+    const hasTotalMatch = exactRows.some((row) => {
+      const rowTotal =
+        row.total ?? (row.subtotal !== null && row.tax !== null ? row.subtotal + row.tax : null);
+      if (rowTotal === null) {
+        return true;
+      }
+      const normalized = Number.parseFloat(rowTotal.toFixed(2));
+      return Math.abs(normalized - roundedTotal) <= 0.01;
+    });
+    if (hasTotalMatch) {
+      return true;
+    }
+  }
+
+  const rows = await db.getAllAsync<{
+    purchase_datetime: string;
+    total: number | null;
+    subtotal: number | null;
+    tax: number | null;
+  }>(`SELECT purchase_datetime, total, subtotal, tax FROM receipts`);
+
+  const target = parseFlexibleDateTime(purchaseDateTime);
+  if (!target) {
+    return false;
+  }
+
+  const targetTime = target.getTime();
+  return rows.some((row) => {
+    const parsed = parseFlexibleDateTime(row.purchase_datetime);
+    if (!parsed) {
+      return false;
+    }
+    const isTimeMatch = Math.abs(parsed.getTime() - targetTime) <= toleranceMs;
+    if (!isTimeMatch) {
+      return false;
+    }
+    const rowTotal =
+      row.total ?? (row.subtotal !== null && row.tax !== null ? row.subtotal + row.tax : null);
+    if (roundedTotal === null) {
+      return true;
+    }
+    if (rowTotal === null) {
+      return true;
+    }
+    const normalized = Number.parseFloat(rowTotal.toFixed(2));
+    return Math.abs(normalized - roundedTotal) <= 0.01;
+  });
+}
+
+export async function hasPossibleDuplicateReceipt(
+  purchaseDateTime: string,
+  total: number | null
+): Promise<boolean> {
+  const db = await getDb();
+  if (!purchaseDateTime) {
+    return false;
+  }
+
+  if (total === null) {
+    const rows = await db.getAllAsync<{ count: number }>(
+      `SELECT COUNT(1) as count
+       FROM receipts
+       WHERE purchase_datetime = ?`,
+      purchaseDateTime
+    );
+    return (rows[0]?.count ?? 0) > 0;
+  }
+
+  const roundedTotal = Number.parseFloat(total.toFixed(2));
+  const rows = await db.getAllAsync<{ count: number }>(
+    `SELECT COUNT(1) as count
+     FROM receipts
+     WHERE purchase_datetime = ?
+       AND (
+         (total IS NOT NULL AND ABS(total - ?) <= 0.01)
+         OR (
+           total IS NULL
+           AND subtotal IS NOT NULL
+           AND tax IS NOT NULL
+           AND ABS((subtotal + tax) - ?) <= 0.01
+         )
+       )`,
+    purchaseDateTime,
+    roundedTotal,
+    roundedTotal
+  );
+  return (rows[0]?.count ?? 0) > 0;
+}
+
+export async function updateReceiptDetails(
+  receiptId: number,
+  updates: {
+    merchant_name: string;
+    purchase_datetime: string;
+    subtotal: number | null;
+    tax: number | null;
+    total: number | null;
+  }
+): Promise<void> {
+  const db = await getDb();
+  await db.runAsync(
+    `UPDATE receipts SET
+      merchant_name = ?,
+      purchase_datetime = ?,
+      subtotal = ?,
+      tax = ?,
+      total = ?
+    WHERE id = ?`,
+    updates.merchant_name,
+    updates.purchase_datetime,
+    updates.subtotal,
+    updates.tax,
+    updates.total,
+    receiptId
+  );
+}
+
+export async function replaceReceiptItems(
+  receiptId: number,
+  items: NewReceiptItem[]
+): Promise<void> {
+  const db = await getDb();
+  await db.execAsync('BEGIN;');
+  try {
+    await db.runAsync(`DELETE FROM receipt_items WHERE receipt_id = ?`, receiptId);
+
+    for (const item of items) {
+      await db.runAsync(
+        `INSERT INTO receipt_items (
+          receipt_id,
+          description_raw,
+          qty,
+          unit_price,
+          line_total
+        ) VALUES (?, ?, ?, ?, ?)`,
+        receiptId,
+        item.description_raw,
+        item.qty ?? null,
+        item.unit_price ?? null,
+        item.line_total ?? null
+      );
+    }
+
+    await db.execAsync('COMMIT;');
+  } catch (error) {
+    await db.execAsync('ROLLBACK;');
+    throw error;
+  }
+}
+
+export async function deleteReceipt(receiptId: number): Promise<void> {
+  const db = await getDb();
+  await db.execAsync('BEGIN;');
+  try {
+    await db.runAsync(`DELETE FROM receipt_items WHERE receipt_id = ?`, receiptId);
+    await db.runAsync(`DELETE FROM receipts WHERE id = ?`, receiptId);
+    await db.execAsync('COMMIT;');
+  } catch (error) {
+    await db.execAsync('ROLLBACK;');
+    throw error;
+  }
 }
