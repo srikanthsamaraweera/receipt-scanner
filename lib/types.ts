@@ -20,3 +20,7 @@ export type ReceiptItem = {
   unit_price: number | null;
   line_total: number | null;
 };
+
+export type ReceiptItemWithReceipt = ReceiptItem & {
+  purchase_datetime: string;
+};

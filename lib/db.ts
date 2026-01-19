@@ -1,7 +1,7 @@
 import * as SQLite from 'expo-sqlite';
 
 import { parseFlexibleDateTime } from './date';
-import { Receipt, ReceiptItem } from './types';
+import { Receipt, ReceiptItem, ReceiptItemWithReceipt } from './types';
 
 let dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
 
@@ -193,6 +193,24 @@ export async function getReceiptItems(receiptId: number): Promise<ReceiptItem[]>
   return db.getAllAsync<ReceiptItem>(
     `SELECT * FROM receipt_items WHERE receipt_id = ? ORDER BY id ASC`,
     receiptId
+  );
+}
+
+export async function getReceiptItemsWithReceipts(): Promise<ReceiptItemWithReceipt[]> {
+  const db = await getDb();
+
+  return db.getAllAsync<ReceiptItemWithReceipt>(
+    `SELECT
+       receipt_items.id,
+       receipt_items.receipt_id,
+       receipt_items.description_raw,
+       receipt_items.qty,
+       receipt_items.unit_price,
+       receipt_items.line_total,
+       receipts.purchase_datetime
+     FROM receipt_items
+     INNER JOIN receipts ON receipts.id = receipt_items.receipt_id
+     ORDER BY receipts.purchase_datetime DESC, receipt_items.id ASC`
   );
 }
 

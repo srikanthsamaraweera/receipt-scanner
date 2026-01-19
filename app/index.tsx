@@ -191,7 +191,16 @@ export default function HomeScreen() {
               <Text style={styles.emptyText}>Tap Add Receipt to create your first entry.</Text>
             </View>
           }
-          ListFooterComponent={<BrandingFooter />}
+          ListFooterComponent={
+            <View style={styles.listFooter}>
+              <Link href="/itemwise-table" asChild>
+                <Pressable style={styles.footerButton}>
+                  <Text style={styles.footerButtonText}>Itemwise table</Text>
+                </Pressable>
+              </Link>
+              <BrandingFooter />
+            </View>
+          }
         />
       )}
     </View>
@@ -248,6 +257,22 @@ const styles = StyleSheet.create({
   listContent: {
     flexGrow: 1,
     paddingBottom: 24,
+  },
+  listFooter: {
+    gap: 12,
+    paddingTop: 12,
+    paddingBottom: 12,
+  },
+  footerButton: {
+    borderWidth: 1,
+    borderColor: '#0F766E',
+    borderRadius: 10,
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  footerButtonText: {
+    color: '#0F766E',
+    fontWeight: '600',
   },
   loadingState: {
     flex: 1,
