@@ -18,6 +18,22 @@ type EditableReceiptItem = {
   lineTotal: string;
 };
 
+const CJK_PATTERN = /[\u3400-\u4dbf\u4e00-\u9fff]/;
+
+const shouldPreferOcrItems = (
+  rawText: string,
+  parsedItems: ParsedReceiptItem[],
+  aiItems: AiReceiptItem[]
+) => {
+  if (!rawText || parsedItems.length === 0) {
+    return false;
+  }
+  if (CJK_PATTERN.test(rawText)) {
+    return true;
+  }
+  return aiItems.length === 0;
+};
+
 export default function AddReceiptScreen() {
   const router = useRouter();
   const headerHeight = useHeaderHeight();
@@ -144,10 +160,12 @@ export default function AddReceiptScreen() {
       let nextItems: EditableReceiptItem[] = [];
       let rawText = '';
       let aiNotice: string | null = null;
+      let aiData: AiReceiptData | null = null;
+      let parsedOcrItems: ParsedReceiptItem[] = [];
 
       if (openAiKey && asset.base64) {
         try {
-          const aiData = await parseReceiptItemsFromImageWithOpenAI(asset.base64, openAiKey);
+          aiData = await parseReceiptItemsFromImageWithOpenAI(asset.base64, openAiKey);
           if (aiData.items.length > 0) {
             nextItems = createEditableItemsFromAi(aiData.items);
           }
@@ -166,33 +184,48 @@ export default function AddReceiptScreen() {
         aiNotice = 'Image data missing for AI parsing. Falling back to OCR text.';
       }
 
+      rawText = await runMlKitOcr(asset.uri);
+      setRawOcrText(rawText);
+      parsedOcrItems = rawText ? parseReceiptItems(rawText) : [];
+      const ocrItems = createEditableItemsFromParsed(parsedOcrItems);
+      const preferOcr = shouldPreferOcrItems(rawText, parsedOcrItems, aiData?.items ?? []);
+
+      if (preferOcr && ocrItems.length > 0) {
+        nextItems = ocrItems;
+      }
+
       if (nextItems.length === 0) {
-        rawText = await runMlKitOcr(asset.uri);
-        setRawOcrText(rawText);
-        nextItems = createEditableItemsFromParsed(parseReceiptItems(rawText));
-        if (openAiKey && rawText) {
-          try {
-            const aiData = await parseReceiptItemsWithOpenAI(rawText, openAiKey);
-            if (aiData.items.length > 0) {
-              nextItems = createEditableItemsFromAi(aiData.items);
-            }
-            if (hasReceiptFields(aiData)) {
-              applyReceiptFields(aiData);
-            } else if (!aiNotice) {
-              aiNotice = 'AI parsing returned no items. Showing best-effort results.';
-            }
-          } catch (error) {
-            if (!aiNotice) {
-              aiNotice =
-                error instanceof Error
-                  ? error.message
-                  : 'AI parsing failed. Showing best-effort results.';
-            }
+        nextItems = ocrItems;
+      }
+
+      const shouldTryAiText =
+        Boolean(openAiKey && rawText) && (!aiData || aiData.items.length === 0);
+      if (shouldTryAiText) {
+        try {
+          const aiTextData = await parseReceiptItemsWithOpenAI(rawText, openAiKey);
+          if (
+            aiTextData.items.length > 0 &&
+            !shouldPreferOcrItems(rawText, parsedOcrItems, aiTextData.items)
+          ) {
+            nextItems = createEditableItemsFromAi(aiTextData.items);
+          }
+          if (hasReceiptFields(aiTextData)) {
+            applyReceiptFields(aiTextData);
+          } else if (!aiNotice) {
+            aiNotice = 'AI parsing returned no items. Showing best-effort results.';
+          }
+        } catch (error) {
+          if (!aiNotice) {
+            aiNotice =
+              error instanceof Error
+                ? error.message
+                : 'AI parsing failed. Showing best-effort results.';
           }
         }
-        if (!rawText && !aiNotice) {
-          aiNotice = 'No text detected in the photo.';
-        }
+      }
+
+      if (!rawText && !aiNotice) {
+        aiNotice = 'No text detected in the photo.';
       }
 
       if (aiNotice) {
