@@ -1,13 +1,13 @@
 import { Link } from 'expo-router';
 import { useCallback, useMemo, useState } from 'react';
-import { ActivityIndicator, FlatList, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Alert, FlatList, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import { useFocusEffect } from '@react-navigation/native';
 
 import BrandingFooter from '@/components/branding-footer';
-import { getReceipts } from '@/lib/db';
+import { exportReceiptBackup, getReceipts, importReceiptBackup } from '@/lib/db';
 import { endOfDay, parseFlexibleDateTime, startOfDay } from '@/lib/date';
-import type { Receipt } from '@/lib/types';
+import type { Receipt, ReceiptBackup } from '@/lib/types';
 
 export default function HomeScreen() {
   const [receipts, setReceipts] = useState<Receipt[]>([]);
@@ -16,6 +16,7 @@ export default function HomeScreen() {
   const [filterTo, setFilterTo] = useState<Date | null>(null);
   const [showFromPicker, setShowFromPicker] = useState(false);
   const [showToPicker, setShowToPicker] = useState(false);
+  const [isBackupBusy, setIsBackupBusy] = useState(false);
 
   const formatDateLabel = (date: Date | null) => {
     if (!date) {
@@ -28,6 +29,227 @@ export default function HomeScreen() {
   };
 
   const parseReceiptDateTime = (value: string) => parseFlexibleDateTime(value);
+
+  const resolveDocumentPickerModule = (module: {
+    getDocumentAsync?: () => Promise<unknown>;
+    default?: {
+      getDocumentAsync?: () => Promise<unknown>;
+    };
+  }) => {
+    if (module.getDocumentAsync) {
+      return module;
+    }
+    if (module.default?.getDocumentAsync) {
+      return module.default;
+    }
+    return module.default ?? module;
+  };
+
+  const resolveFileSystemModule = (module: { default?: unknown }) =>
+    ('default' in module && module.default ? module.default : module);
+
+  const resolveSharingModule = (module: {
+    shareAsync?: (...args: never[]) => Promise<unknown>;
+    isAvailableAsync?: () => Promise<boolean>;
+    default?: {
+      shareAsync?: (...args: never[]) => Promise<unknown>;
+      isAvailableAsync?: () => Promise<boolean>;
+    };
+  }) => {
+    if (module.shareAsync || module.isAvailableAsync) {
+      return module;
+    }
+    if (module.default?.shareAsync || module.default?.isAvailableAsync) {
+      return module.default;
+    }
+    return module.default ?? module;
+  };
+
+  const loadBackupModules = async () => {
+    try {
+      const [DocumentPickerModule, FileSystemModule, SharingModule] = await Promise.all([
+        import('expo-document-picker'),
+        import('expo-file-system/legacy'),
+        import('expo-sharing'),
+      ]);
+      return {
+        DocumentPicker: resolveDocumentPickerModule(DocumentPickerModule),
+        FileSystem: resolveFileSystemModule(FileSystemModule),
+        Sharing: resolveSharingModule(SharingModule),
+      };
+    } catch (error) {
+      const message =
+        error instanceof Error && error.message
+          ? error.message
+          : 'Backup modules are unavailable.';
+      throw new Error(
+        `${message} Rebuild the dev client to include expo-document-picker, expo-file-system, and expo-sharing.`
+      );
+    }
+  };
+
+  const parseBackupPayload = (raw: string): ReceiptBackup => {
+    const parsed = JSON.parse(raw) as ReceiptBackup;
+    if (!parsed || parsed.version !== 1) {
+      throw new Error('Unsupported backup format.');
+    }
+    if (!Array.isArray(parsed.receipts) || !Array.isArray(parsed.items)) {
+      throw new Error('Invalid backup data.');
+    }
+    return parsed;
+  };
+
+  const confirmImport = () =>
+    new Promise<boolean>((resolve) => {
+      if (receipts.length === 0) {
+        resolve(true);
+        return;
+      }
+      Alert.alert(
+        'Import receipts?',
+        'Importing will add receipts to your current list. Continue?',
+        [
+          { text: 'Cancel', style: 'cancel', onPress: () => resolve(false) },
+          { text: 'Import', onPress: () => resolve(true) },
+        ]
+      );
+    });
+
+  const resolveDownloadDirectory = async (
+    FileSystem: {
+      StorageAccessFramework?: {
+        getUriForDirectoryInRoot: (folderName: string) => string;
+        requestDirectoryPermissionsAsync: (
+          initialFileUrl?: string | null
+        ) => Promise<{ granted: boolean; directoryUri: string }>;
+      };
+    }
+  ) => {
+    const saf = FileSystem.StorageAccessFramework;
+    if (!saf || Platform.OS !== 'android') {
+      return null;
+    }
+    const downloadUri = saf.getUriForDirectoryInRoot('Download');
+    const permissions = await saf.requestDirectoryPermissionsAsync(downloadUri);
+    if (!permissions.granted) {
+      return null;
+    }
+    return permissions.directoryUri;
+  };
+
+  const writeBackupFile = async (
+    backup: ReceiptBackup,
+    fileName: string,
+    FileSystem: {
+      documentDirectory?: string | null;
+      cacheDirectory?: string | null;
+      EncodingType: { UTF8: string };
+      writeAsStringAsync: (uri: string, data: string, options: { encoding: string }) => Promise<void>;
+      StorageAccessFramework?: {
+        requestDirectoryPermissionsAsync: () => Promise<{ granted: boolean; directoryUri: string }>;
+        createFileAsync: (directoryUri: string, name: string, mimeType: string) => Promise<string>;
+        getUriForDirectoryInRoot: (folderName: string) => string;
+      };
+    }
+  ) => {
+    const data = JSON.stringify(backup);
+    const downloadDirectory = await resolveDownloadDirectory(FileSystem);
+    if (downloadDirectory && FileSystem.StorageAccessFramework) {
+      const fileUri = await FileSystem.StorageAccessFramework.createFileAsync(
+        downloadDirectory,
+        fileName,
+        'application/json'
+      );
+      await FileSystem.writeAsStringAsync(fileUri, data, {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+      return { fileUri, shouldShare: false };
+    }
+
+    const baseDir = FileSystem.documentDirectory ?? FileSystem.cacheDirectory;
+    if (baseDir) {
+      const fileUri = `${baseDir}${fileName}`;
+      await FileSystem.writeAsStringAsync(fileUri, data, {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+      return { fileUri, shouldShare: true };
+    }
+
+    throw new Error('Unable to access Downloads. Please allow access when prompted.');
+  };
+
+  const handleExport = async () => {
+    if (isBackupBusy) {
+      return;
+    }
+    setIsBackupBusy(true);
+    try {
+      const { FileSystem, Sharing } = await loadBackupModules();
+      const backup = await exportReceiptBackup();
+      const safeTimestamp = backup.exported_at.replace(/[:.]/g, '-');
+      const fileName = `receipt-backup-${safeTimestamp}.json`;
+      const { fileUri, shouldShare } = await writeBackupFile(
+        backup,
+        fileName,
+        FileSystem
+      );
+
+      if (shouldShare && (await Sharing.isAvailableAsync())) {
+        await Sharing.shareAsync(fileUri, {
+          mimeType: 'application/json',
+          dialogTitle: 'Export receipts backup',
+        });
+      } else {
+        Alert.alert('Export complete', `Backup saved.`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to export receipts.';
+      Alert.alert('Export failed', message);
+    } finally {
+      setIsBackupBusy(false);
+    }
+  };
+
+  const handleImport = async () => {
+    if (isBackupBusy) {
+      return;
+    }
+    setIsBackupBusy(true);
+    try {
+      const { DocumentPicker, FileSystem } = await loadBackupModules();
+      const pickResult = await DocumentPicker.getDocumentAsync({
+        type: 'application/json',
+        copyToCacheDirectory: true,
+      });
+      if (pickResult.canceled) {
+        return;
+      }
+      const pickedFile = pickResult.assets?.[0];
+      if (!pickedFile?.uri) {
+        throw new Error('No file selected.');
+      }
+      const raw = await FileSystem.readAsStringAsync(pickedFile.uri, {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+      const backup = parseBackupPayload(raw);
+      const canImport = await confirmImport();
+      if (!canImport) {
+        return;
+      }
+      const result = await importReceiptBackup(backup);
+      const updatedReceipts = await getReceipts();
+      setReceipts(updatedReceipts);
+      Alert.alert(
+        'Import complete',
+        `Imported ${result.receiptsImported} receipts and ${result.itemsImported} items.`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to import receipts.';
+      Alert.alert('Import failed', message);
+    } finally {
+      setIsBackupBusy(false);
+    }
+  };
 
   const filteredReceipts = useMemo(() => {
     if (!filterFrom && !filterTo) {
@@ -95,6 +317,22 @@ export default function HomeScreen() {
             <Text style={styles.secondaryButtonText}>Sign In</Text>
           </Pressable>
         </Link>
+      </View>
+      <View style={styles.backupActions}>
+        <Pressable
+          style={[styles.utilityButton, isBackupBusy && styles.utilityButtonDisabled]}
+          onPress={handleExport}
+          disabled={isBackupBusy}
+        >
+          <Text style={styles.utilityButtonText}>Export Data</Text>
+        </Pressable>
+        <Pressable
+          style={[styles.utilityButton, isBackupBusy && styles.utilityButtonDisabled]}
+          onPress={handleImport}
+          disabled={isBackupBusy}
+        >
+          <Text style={styles.utilityButtonText}>Import Data</Text>
+        </Pressable>
       </View>
 
       <View style={styles.filterRow}>
@@ -232,6 +470,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 12,
   },
+  backupActions: {
+    flexDirection: 'row',
+    gap: 12,
+    marginBottom: 12,
+  },
   primaryButton: {
     backgroundColor: '#0F766E',
     paddingVertical: 12,
@@ -252,6 +495,22 @@ const styles = StyleSheet.create({
   },
   secondaryButtonText: {
     color: '#0F766E',
+    fontWeight: '600',
+  },
+  utilityButton: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#D1D5DB',
+    paddingVertical: 10,
+    borderRadius: 10,
+    alignItems: 'center',
+    backgroundColor: '#FFFFFF',
+  },
+  utilityButtonDisabled: {
+    opacity: 0.6,
+  },
+  utilityButtonText: {
+    color: '#111827',
     fontWeight: '600',
   },
   listContent: {

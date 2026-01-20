@@ -1,7 +1,7 @@
 import * as SQLite from 'expo-sqlite';
 
 import { parseFlexibleDateTime } from './date';
-import { Receipt, ReceiptItem, ReceiptItemWithReceipt } from './types';
+import { Receipt, ReceiptBackup, ReceiptItem, ReceiptItemWithReceipt } from './types';
 
 let dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
 
@@ -196,6 +196,14 @@ export async function getReceiptItems(receiptId: number): Promise<ReceiptItem[]>
   );
 }
 
+export async function getAllReceiptItems(): Promise<ReceiptItem[]> {
+  const db = await getDb();
+
+  return db.getAllAsync<ReceiptItem>(
+    `SELECT * FROM receipt_items ORDER BY receipt_id ASC, id ASC`
+  );
+}
+
 export async function getReceiptItemsWithReceipts(): Promise<ReceiptItemWithReceipt[]> {
   const db = await getDb();
 
@@ -212,6 +220,78 @@ export async function getReceiptItemsWithReceipts(): Promise<ReceiptItemWithRece
      INNER JOIN receipts ON receipts.id = receipt_items.receipt_id
      ORDER BY receipts.purchase_datetime DESC, receipt_items.id ASC`
   );
+}
+
+export async function exportReceiptBackup(): Promise<ReceiptBackup> {
+  const [receipts, items] = await Promise.all([getReceipts(), getAllReceiptItems()]);
+
+  return {
+    version: 1,
+    exported_at: new Date().toISOString(),
+    receipts,
+    items,
+  };
+}
+
+export async function importReceiptBackup(backup: ReceiptBackup): Promise<{
+  receiptsImported: number;
+  itemsImported: number;
+  skippedItems: number;
+}> {
+  if (!backup || backup.version !== 1) {
+    throw new Error('Unsupported backup format.');
+  }
+  if (!Array.isArray(backup.receipts) || !Array.isArray(backup.items)) {
+    throw new Error('Invalid backup data.');
+  }
+
+  const db = await getDb();
+  await db.execAsync('BEGIN;');
+  try {
+    const receiptIdMap = new Map<number, number>();
+
+    for (const receipt of backup.receipts) {
+      const { id: legacyId, created_at, ...rest } = receipt;
+      const newId = await insertReceipt(
+        {
+          ...rest,
+          created_at,
+        },
+        { allowDuplicate: true }
+      );
+      receiptIdMap.set(legacyId, newId);
+    }
+
+    let itemsImported = 0;
+    let skippedItems = 0;
+
+    for (const item of backup.items) {
+      const mappedReceiptId = receiptIdMap.get(item.receipt_id);
+      if (!mappedReceiptId) {
+        skippedItems += 1;
+        continue;
+      }
+      await insertReceiptItem({
+        receipt_id: mappedReceiptId,
+        description_raw: item.description_raw,
+        qty: item.qty,
+        unit_price: item.unit_price,
+        line_total: item.line_total,
+      });
+      itemsImported += 1;
+    }
+
+    await db.execAsync('COMMIT;');
+
+    return {
+      receiptsImported: backup.receipts.length,
+      itemsImported,
+      skippedItems,
+    };
+  } catch (error) {
+    await db.execAsync('ROLLBACK;');
+    throw error;
+  }
 }
 
 function createReceiptDedupeKey(

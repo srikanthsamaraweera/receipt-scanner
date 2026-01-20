@@ -24,3 +24,10 @@ export type ReceiptItem = {
 export type ReceiptItemWithReceipt = ReceiptItem & {
   purchase_datetime: string;
 };
+
+export type ReceiptBackup = {
+  version: 1;
+  exported_at: string;
+  receipts: Receipt[];
+  items: ReceiptItem[];
+};
