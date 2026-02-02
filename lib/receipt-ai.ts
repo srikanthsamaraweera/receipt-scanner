@@ -22,6 +22,8 @@ type OpenAiChatResponse = {
   }>;
 };
 
+import { GoogleGenerativeAI } from '@google/generative-ai';
+
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 const RECEIPT_SCHEMA = {
   type: 'object',
@@ -73,7 +75,7 @@ function normalizeAiReceiptData(data: AiReceiptData): AiReceiptData {
         : null,
     purchase_datetime:
       typeof data.purchase_datetime === 'string' &&
-      data.purchase_datetime.trim().length > 0
+        data.purchase_datetime.trim().length > 0
         ? data.purchase_datetime.trim()
         : null,
     subtotal:
@@ -218,4 +220,86 @@ export async function parseReceiptItemsFromImageWithOpenAI(
 
   const data = (await response.json()) as OpenAiChatResponse;
   return parseReceiptDataFromContent(data.choices?.[0]?.message?.content ?? '');
+}
+
+/**
+ * GEMINI IMPLEMENTATION
+ */
+
+const GEMINI_SYSTEM_PROMPT = `
+You extract receipt line items and totals from Canadian grocery receipts. Return only purchasable items, excluding totals, taxes, loyalty, coupons, and payment lines. Price must be the unit price (per item) and line_total is the final amount charged for the line. Ignore tax codes, item codes, and category headers. Be precise with quantities and unit prices, especially for weighted items.
+
+Output JSON only. matching this schema:
+${JSON.stringify(RECEIPT_SCHEMA, null, 2)}
+`;
+
+const GEMINI_MODEL = 'gemini-2.5-flash';
+
+export async function parseReceiptItemsWithGemini(
+  rawText: string,
+  apiKey: string
+): Promise<AiReceiptData> {
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({
+    model: GEMINI_MODEL,
+    generationConfig: { responseMimeType: 'application/json' },
+  });
+
+  const prompt = `
+${GEMINI_SYSTEM_PROMPT}
+
+The receipt is from a Canadian grocery store (No Frills, Costco, Walmart, Giant Tiger) or a Chinese market (Al Premium, Scarborough), or a small local grocer. Extract items with name, quantity, unit price (per item), and line total (final amount charged) from this receipt text. Lines for a single item may be split across two or three rows; merge them. Prices are typically right-aligned at the end of the last line for an item, so attach that price to the item text immediately above it. Ignore tax codes, item codes, and category headers.
+
+Quantity/unit-price rules (think like a shopper):
+- Weighted items: if you see weight like "0.78 kg" or "0.335kg", quantity is that weight. If you see "@ 2.16/kg", unit price is 2.16 (per kg). If a line total is shown (e.g., 0.72), do not use it as unit price.
+- Multi-quantity items: if you see "2 @ 1.50" or "2x 1.50", quantity is 2 and unit price is 1.50.
+- If a line total is present and quantity > 1 or quantity is a weight but unit price is missing, compute unit price = line total / quantity (round to 2 decimals).
+- If no quantity is present, assume quantity = 1 and unit price = the single price shown. Line total should still be the final amount charged for that line.
+
+Also extract merchant name, purchase date/time, subtotal, tax, and total when present. If a field is missing, return null.
+
+${rawText}
+  `;
+
+  const result = await model.generateContent(prompt);
+  const response = result.response;
+  const text = response.text();
+  return parseReceiptDataFromContent(text);
+}
+
+export async function parseReceiptItemsFromImageWithGemini(
+  base64Image: string,
+  apiKey: string
+): Promise<AiReceiptData> {
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({
+    model: GEMINI_MODEL,
+    generationConfig: { responseMimeType: 'application/json' },
+  });
+
+  const prompt = `
+${GEMINI_SYSTEM_PROMPT}
+
+The receipt is from a Canadian grocery store (No Frills, Costco, Walmart, Giant Tiger) or a Chinese market (Al Premium, Scarborough), or a small local grocer. Extract items with name, quantity, unit price (per item), and line total (final amount charged). Lines for a single item may be split across two or three rows; merge them. Prices are typically right-aligned at the end of the last line for an item, so attach that price to the item text immediately above it. Ignore tax codes, item codes, and category headers.
+
+Quantity/unit-price rules (think like a shopper):
+- Weighted items: if you see weight like "0.78 kg" or "0.335kg", quantity is that weight. If you see "@ 2.16/kg", unit price is 2.16 (per kg). If a line total is shown (e.g., 0.72), do not use it as unit price.
+- Multi-quantity items: if you see "2 @ 1.50" or "2x 1.50", quantity is 2 and unit price is 1.50.
+- If a line total is present and quantity > 1 or quantity is a weight but unit price is missing, compute unit price = line total / quantity (round to 2 decimals).
+- If no quantity is present, assume quantity = 1 and unit price = the single price shown. Line total should still be the final amount charged for that line.
+
+Also extract merchant name, purchase date/time, subtotal, tax, and total when present. If a field is missing, return null.
+  `;
+
+  const imagePart = {
+    inlineData: {
+      data: base64Image,
+      mimeType: 'image/jpeg',
+    },
+  };
+
+  const result = await model.generateContent([prompt, imagePart]);
+  const response = result.response;
+  const text = response.text();
+  return parseReceiptDataFromContent(text);
 }
