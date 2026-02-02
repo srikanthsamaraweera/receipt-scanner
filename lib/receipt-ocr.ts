@@ -43,7 +43,7 @@ function shouldIgnoreLine(line: string): boolean {
 }
 
 function hasLetters(line: string): boolean {
-  return /[A-Za-z]/.test(line);
+  return /[A-Za-z\u3400-\u4dbf\u4e00-\u9fff]/.test(line);
 }
 
 function looksLikeCategoryHeader(line: string): boolean {
@@ -114,6 +114,10 @@ function removeUnitFragment(line: string): string {
   );
 }
 
+function joinDescriptionParts(parts: string[]): string {
+  return parts.join(' ').replace(/\s{2,}/g, ' ').trim();
+}
+
 export async function runMlKitOcr(imageUri: string): Promise<string> {
   const result = await TextRecognition.recognize(imageUri);
   return result?.text?.trim() ?? '';
@@ -126,7 +130,7 @@ export function parseReceiptItems(rawText: string): ParsedReceiptItem[] {
     .filter((line) => line.length > 0 && !shouldIgnoreLine(line));
 
   const items: ParsedReceiptItem[] = [];
-  let pendingDescription: string | null = null;
+  let pendingDescriptionParts: string[] = [];
   let pendingUnit: UnitLine | null = null;
 
   for (const line of lines) {
@@ -152,7 +156,10 @@ export function parseReceiptItems(rawText: string): ParsedReceiptItem[] {
           pendingUnit = unitLine;
         }
       } else if (hasLetters(sanitizedLine)) {
-        pendingDescription = sanitizedLine;
+        pendingDescriptionParts.push(sanitizedLine);
+        if (pendingDescriptionParts.length > 3) {
+          pendingDescriptionParts.shift();
+        }
       }
       continue;
     }
@@ -184,6 +191,7 @@ export function parseReceiptItems(rawText: string): ParsedReceiptItem[] {
     if (unitLine) {
       descriptionPart = removeUnitFragment(descriptionPart);
     }
+    const pendingDescription = joinDescriptionParts(pendingDescriptionParts);
     if (!hasLetters(descriptionPart) && pendingDescription) {
       descriptionPart = pendingDescription;
     }
@@ -229,7 +237,7 @@ export function parseReceiptItems(rawText: string): ParsedReceiptItem[] {
       unitPrice,
       lineTotal,
     });
-    pendingDescription = null;
+    pendingDescriptionParts = [];
   }
 
   return items;
