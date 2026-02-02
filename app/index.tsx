@@ -1,12 +1,13 @@
-import { Link } from 'expo-router';
-import { useCallback, useMemo, useState } from 'react';
-import { ActivityIndicator, Alert, FlatList, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import { useFocusEffect } from '@react-navigation/native';
+import { Link, Stack } from 'expo-router';
+import { useCallback, useMemo, useState } from 'react';
+import { ActivityIndicator, Alert, FlatList, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import BrandingFooter from '@/components/branding-footer';
-import { exportReceiptBackup, getReceipts, importReceiptBackup } from '@/lib/db';
 import { endOfDay, parseFlexibleDateTime, startOfDay } from '@/lib/date';
+import { exportReceiptBackup, getReceipts, importReceiptBackup } from '@/lib/db';
 import type { Receipt, ReceiptBackup } from '@/lib/types';
 
 export default function HomeScreen() {
@@ -301,6 +302,17 @@ export default function HomeScreen() {
 
   return (
     <View style={styles.container}>
+      <Stack.Screen
+        options={{
+          headerRight: () => (
+            <Link href="/settings" asChild>
+              <Pressable hitSlop={10}>
+                <Ionicons name="settings-outline" size={24} color="#0F766E" />
+              </Pressable>
+            </Link>
+          ),
+        }}
+      />
       <View style={styles.header}>
         <Text style={styles.title}>My Receipts</Text>
         <Text style={styles.subtitle}>Saved locally on your device.</Text>

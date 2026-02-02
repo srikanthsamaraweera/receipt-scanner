@@ -24,6 +24,7 @@ export default function RootLayout() {
         <Stack.Screen name="login" options={{ title: 'Sign In' }} />
         <Stack.Screen name="add-receipt" options={{ title: 'Add Receipt' }} />
         <Stack.Screen name="itemwise-table" options={{ title: 'Itemwise Table' }} />
+        <Stack.Screen name="settings" options={{ title: 'Settings', presentation: 'modal' }} />
       </Stack>
       <StatusBar style="auto" />
     </>

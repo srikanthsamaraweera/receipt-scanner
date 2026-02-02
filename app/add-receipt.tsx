@@ -1,14 +1,28 @@
-import { useEffect, useState } from 'react';
-import { ActivityIndicator, Alert, Image, KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useHeaderHeight } from '@react-navigation/elements';
 import * as ImagePicker from 'expo-image-picker';
 import { useRouter } from 'expo-router';
+import { useEffect, useState } from 'react';
+import { ActivityIndicator, Alert, Image, KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import BrandingFooter from '@/components/branding-footer';
-import { hasPossibleDuplicateReceipt, insertReceipt, insertReceiptItem } from '@/lib/db';
 import { normalizeReceiptDateTimeFromScan } from '@/lib/date';
+import { hasPossibleDuplicateReceipt, insertReceipt, insertReceiptItem } from '@/lib/db';
+import {
+  parseReceiptItemsFromImageWithGemini,
+  parseReceiptItemsFromImageWithOpenAI,
+  parseReceiptItemsWithGemini,
+  parseReceiptItemsWithOpenAI,
+  type AiReceiptData,
+  type AiReceiptItem,
+} from '@/lib/receipt-ai';
 import { parseReceiptItems, runMlKitOcr, type ParsedReceiptItem } from '@/lib/receipt-ocr';
-import { parseReceiptItemsFromImageWithOpenAI, parseReceiptItemsWithOpenAI, type AiReceiptData, type AiReceiptItem } from '@/lib/receipt-ai';
+import * as SecureStore from 'expo-secure-store';
+
+const AI_PROVIDER_KEY = 'receipt_scanner_ai_provider';
+const PROVIDERS = {
+  GEMINI: 'gemini',
+  OPENAI: 'openai',
+};
 
 type EditableReceiptItem = {
   id: string;
@@ -101,10 +115,10 @@ export default function AddReceiptScreen() {
   const hasReceiptFields = (receipt: AiReceiptData) =>
     Boolean(
       receipt.merchant ||
-        receipt.purchase_datetime ||
-        receipt.subtotal !== null ||
-        receipt.tax !== null ||
-        receipt.total !== null
+      receipt.purchase_datetime ||
+      receipt.subtotal !== null ||
+      receipt.tax !== null ||
+      receipt.total !== null
     );
 
   const updateItem = (id: string, updates: Partial<EditableReceiptItem>) => {
@@ -156,37 +170,60 @@ export default function AddReceiptScreen() {
 
     setIsProcessing(true);
     try {
+      const storedProvider = await SecureStore.getItemAsync(AI_PROVIDER_KEY);
+      const provider = storedProvider ?? PROVIDERS.GEMINI;
+
       const openAiKey = process.env.EXPO_PUBLIC_OPENAI_API_KEY;
+      const geminiKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
+
       let nextItems: EditableReceiptItem[] = [];
       let rawText = '';
       let aiNotice: string | null = null;
       let aiData: AiReceiptData | null = null;
       let parsedOcrItems: ParsedReceiptItem[] = [];
 
-      if (openAiKey && asset.base64) {
+      // 1. Try AI Image Parsing
+      if (asset.base64) {
         try {
-          aiData = await parseReceiptItemsFromImageWithOpenAI(asset.base64, openAiKey);
-          if (aiData.items.length > 0) {
-            nextItems = createEditableItemsFromAi(aiData.items);
-          }
-          if (hasReceiptFields(aiData)) {
-            applyReceiptFields(aiData);
+          if (provider === PROVIDERS.GEMINI && geminiKey) {
+            aiData = await parseReceiptItemsFromImageWithGemini(asset.base64, geminiKey);
+          } else if (provider === PROVIDERS.OPENAI && openAiKey) {
+            aiData = await parseReceiptItemsFromImageWithOpenAI(asset.base64, openAiKey);
           } else {
-            aiNotice = 'AI parsing returned no items. Falling back to OCR text.';
+            // Missing key for selected provider
+            if (provider === PROVIDERS.GEMINI && !geminiKey) aiNotice = 'Gemini API key missing.';
+            if (provider === PROVIDERS.OPENAI && !openAiKey) aiNotice = 'OpenAI API key missing.';
+          }
+
+          if (aiData) {
+            if (aiData.items.length > 0) {
+              nextItems = createEditableItemsFromAi(aiData.items);
+            }
+            if (hasReceiptFields(aiData)) {
+              applyReceiptFields(aiData);
+            } else {
+              aiNotice = 'AI parsing returned no items. Falling back to OCR text.';
+            }
           }
         } catch (error) {
-          aiNotice =
-            error instanceof Error
-              ? `${error.message} Falling back to OCR text.`
-              : 'AI parsing failed. Falling back to OCR text.';
+          console.warn('AI Image Parsing Error', error);
+          aiNotice = error instanceof Error ? `AI Error: ${error.message}` : 'AI parsing failed.';
         }
-      } else if (openAiKey && !asset.base64) {
-        aiNotice = 'Image data missing for AI parsing. Falling back to OCR text.';
       }
 
-      rawText = await runMlKitOcr(asset.uri);
-      setRawOcrText(rawText);
-      parsedOcrItems = rawText ? parseReceiptItems(rawText) : [];
+      // 2. Run OCR (Always run as fallback/verification)
+      // 2. Run OCR (Best effort, skip if native module missing)
+      try {
+        rawText = await runMlKitOcr(asset.uri);
+        setRawOcrText(rawText);
+        parsedOcrItems = rawText ? parseReceiptItems(rawText) : [];
+      } catch (e) {
+        console.warn('OCR skipped or failed (likely running in Expo Go without native module):', e);
+        // Fallback: Proceed without OCR data, relying purely on AI
+        setRawOcrText(null);
+        parsedOcrItems = [];
+      }
+
       const ocrItems = createEditableItemsFromParsed(parsedOcrItems);
       const preferOcr = shouldPreferOcrItems(rawText, parsedOcrItems, aiData?.items ?? []);
 
@@ -198,28 +235,34 @@ export default function AddReceiptScreen() {
         nextItems = ocrItems;
       }
 
-      const shouldTryAiText =
-        Boolean(openAiKey && rawText) && (!aiData || aiData.items.length === 0);
+      // 3. Try AI Text Parsing if Image Parsing failed or wasn't run
+      const shouldTryAiText = Boolean(rawText) && (!aiData || aiData.items.length === 0);
+
       if (shouldTryAiText) {
         try {
-          const aiTextData = await parseReceiptItemsWithOpenAI(rawText, openAiKey);
-          if (
-            aiTextData.items.length > 0 &&
-            !shouldPreferOcrItems(rawText, parsedOcrItems, aiTextData.items)
-          ) {
-            nextItems = createEditableItemsFromAi(aiTextData.items);
+          let aiTextData: AiReceiptData | null = null;
+          if (provider === PROVIDERS.GEMINI && geminiKey) {
+            aiTextData = await parseReceiptItemsWithGemini(rawText, geminiKey);
+          } else if (provider === PROVIDERS.OPENAI && openAiKey) {
+            aiTextData = await parseReceiptItemsWithOpenAI(rawText, openAiKey);
           }
-          if (hasReceiptFields(aiTextData)) {
-            applyReceiptFields(aiTextData);
-          } else if (!aiNotice) {
-            aiNotice = 'AI parsing returned no items. Showing best-effort results.';
+
+          if (aiTextData) {
+            if (
+              aiTextData.items.length > 0 &&
+              !shouldPreferOcrItems(rawText, parsedOcrItems, aiTextData.items)
+            ) {
+              nextItems = createEditableItemsFromAi(aiTextData.items);
+            }
+            if (hasReceiptFields(aiTextData)) {
+              applyReceiptFields(aiTextData);
+            } else if (!aiNotice) {
+              aiNotice = 'AI parsing returned no items. Showing best-effort results.';
+            }
           }
         } catch (error) {
           if (!aiNotice) {
-            aiNotice =
-              error instanceof Error
-                ? error.message
-                : 'AI parsing failed. Showing best-effort results.';
+            aiNotice = error instanceof Error ? error.message : 'AI parsing failed.';
           }
         }
       }
@@ -267,9 +310,9 @@ export default function AddReceiptScreen() {
       hasPossibleDuplicateReceipt(normalized, null)
         .then((hasDuplicate) => {
           if (isActive) {
-          setPurchaseDateWarning(hasDuplicate);
-        }
-      })
+            setPurchaseDateWarning(hasDuplicate);
+          }
+        })
         .catch(() => {
           if (isActive) {
             setPurchaseDateWarning(false);
@@ -435,186 +478,186 @@ export default function AddReceiptScreen() {
       >
         <Text style={styles.title}>Add Receipt</Text>
 
-      <View style={styles.section}>
-        <Text style={styles.label}>Merchant</Text>
-        <TextInput
-          style={styles.input}
-          placeholder="Coffee Shop"
-          placeholderTextColor="#6B7280"
-          value={merchant}
-          onChangeText={setMerchant}
-        />
-      </View>
-
-      <View style={styles.section}>
-        <Text style={styles.label}>Purchase date and time</Text>
-        <TextInput
-          style={[styles.input, purchaseDateWarning && styles.inputWarning]}
-          placeholder="2025-01-14 13:45"
-          placeholderTextColor="#6B7280"
-          value={purchaseDateTime}
-          onChangeText={setPurchaseDateTime}
-        />
-      </View>
-
-      <View style={styles.section}>
-        <Text style={styles.label}>Subtotal</Text>
-        <TextInput
-          style={styles.input}
-          placeholder="0.00"
-          placeholderTextColor="#6B7280"
-          keyboardType="numeric"
-          value={subtotal}
-          onChangeText={setSubtotal}
-        />
-      </View>
-
-      <View style={styles.section}>
-        <Text style={styles.label}>Tax</Text>
-        <TextInput
-          style={styles.input}
-          placeholder="0.00"
-          placeholderTextColor="#6B7280"
-          keyboardType="numeric"
-          value={tax}
-          onChangeText={setTax}
-        />
-      </View>
-
-      <View style={styles.section}>
-        <Text style={styles.label}>Total</Text>
-        <TextInput
-          style={styles.input}
-          placeholder="0.00"
-          placeholderTextColor="#6B7280"
-          keyboardType="numeric"
-          value={total}
-          onChangeText={setTotal}
-        />
-      </View>
-
-      <View style={styles.section}>
-        <Text style={styles.label}>Receipt photo</Text>
-        <Pressable style={styles.outlineButton} onPress={handleAttachPhoto}>
-          <Text style={styles.outlineButtonText}>Attach Photo</Text>
-        </Pressable>
-        <View style={styles.imagePlaceholder}>
-          {photoUri ? (
-            <Image source={{ uri: photoUri }} style={styles.imagePreview} resizeMode="cover" />
-          ) : (
-            <Text style={styles.imagePlaceholderText}>No image selected</Text>
-          )}
+        <View style={styles.section}>
+          <Text style={styles.label}>Merchant</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="Coffee Shop"
+            placeholderTextColor="#6B7280"
+            value={merchant}
+            onChangeText={setMerchant}
+          />
         </View>
-      </View>
 
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Items</Text>
-        <View style={styles.itemCard}>
-          {isProcessing ? (
-            <View style={styles.processingRow}>
-              <ActivityIndicator size="small" color="#0F766E" />
-              <Text style={styles.itemText}>Reading receipt text...</Text>
-            </View>
-          ) : items.length > 0 ? (
-            <View style={styles.table}>
-              <View style={[styles.tableRow, styles.tableHeaderRow]}>
-                <Text style={[styles.tableCell, styles.tableHeaderCell, styles.tableCellName]}>
-                  Item
-                </Text>
-                <Text style={[styles.tableCell, styles.tableHeaderCell, styles.tableCellQty]}>
-                  Qty
-                </Text>
-                <Text style={[styles.tableCell, styles.tableHeaderCell, styles.tableCellPrice]}>
-                  Unit Price
-                </Text>
-                <Text style={[styles.tableCell, styles.tableHeaderCell, styles.tableCellLineTotal]}>
-                  Line Total
-                </Text>
+        <View style={styles.section}>
+          <Text style={styles.label}>Purchase date and time</Text>
+          <TextInput
+            style={[styles.input, purchaseDateWarning && styles.inputWarning]}
+            placeholder="2025-01-14 13:45"
+            placeholderTextColor="#6B7280"
+            value={purchaseDateTime}
+            onChangeText={setPurchaseDateTime}
+          />
+        </View>
+
+        <View style={styles.section}>
+          <Text style={styles.label}>Subtotal</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="0.00"
+            placeholderTextColor="#6B7280"
+            keyboardType="numeric"
+            value={subtotal}
+            onChangeText={setSubtotal}
+          />
+        </View>
+
+        <View style={styles.section}>
+          <Text style={styles.label}>Tax</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="0.00"
+            placeholderTextColor="#6B7280"
+            keyboardType="numeric"
+            value={tax}
+            onChangeText={setTax}
+          />
+        </View>
+
+        <View style={styles.section}>
+          <Text style={styles.label}>Total</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="0.00"
+            placeholderTextColor="#6B7280"
+            keyboardType="numeric"
+            value={total}
+            onChangeText={setTotal}
+          />
+        </View>
+
+        <View style={styles.section}>
+          <Text style={styles.label}>Receipt photo</Text>
+          <Pressable style={styles.outlineButton} onPress={handleAttachPhoto}>
+            <Text style={styles.outlineButtonText}>Attach Photo</Text>
+          </Pressable>
+          <View style={styles.imagePlaceholder}>
+            {photoUri ? (
+              <Image source={{ uri: photoUri }} style={styles.imagePreview} resizeMode="cover" />
+            ) : (
+              <Text style={styles.imagePlaceholderText}>No image selected</Text>
+            )}
+          </View>
+        </View>
+
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Items</Text>
+          <View style={styles.itemCard}>
+            {isProcessing ? (
+              <View style={styles.processingRow}>
+                <ActivityIndicator size="small" color="#0F766E" />
+                <Text style={styles.itemText}>Reading receipt text...</Text>
               </View>
-              {items.map((item) => (
-                <View key={item.id} style={styles.tableRow}>
-                  <TextInput
-                    style={[styles.tableCell, styles.tableCellName]}
-                    value={item.name}
-                    onChangeText={(value) => updateItem(item.id, { name: value })}
-                    placeholder="Item name"
-                    placeholderTextColor="#9CA3AF"
-                  />
-                  <TextInput
-                    style={[styles.tableCell, styles.tableCellQty]}
-                    value={item.qty}
-                    onChangeText={(value) => updateItem(item.id, { qty: value })}
-                    placeholder="-"
-                    placeholderTextColor="#9CA3AF"
-                    keyboardType="decimal-pad"
-                  />
-                  <TextInput
-                    style={[styles.tableCell, styles.tableCellPrice]}
-                    value={item.price}
-                    onChangeText={(value) => updateItem(item.id, { price: value })}
-                    placeholder="0.00"
-                    placeholderTextColor="#9CA3AF"
-                    keyboardType="decimal-pad"
-                  />
-                  <TextInput
-                    style={[styles.tableCell, styles.tableCellLineTotal]}
-                    value={item.lineTotal}
-                    onChangeText={(value) => updateItem(item.id, { lineTotal: value })}
-                    placeholder="0.00"
-                    placeholderTextColor="#9CA3AF"
-                    keyboardType="decimal-pad"
-                  />
+            ) : items.length > 0 ? (
+              <View style={styles.table}>
+                <View style={[styles.tableRow, styles.tableHeaderRow]}>
+                  <Text style={[styles.tableCell, styles.tableHeaderCell, styles.tableCellName]}>
+                    Item
+                  </Text>
+                  <Text style={[styles.tableCell, styles.tableHeaderCell, styles.tableCellQty]}>
+                    Qty
+                  </Text>
+                  <Text style={[styles.tableCell, styles.tableHeaderCell, styles.tableCellPrice]}>
+                    Unit Price
+                  </Text>
+                  <Text style={[styles.tableCell, styles.tableHeaderCell, styles.tableCellLineTotal]}>
+                    Line Total
+                  </Text>
                 </View>
-              ))}
-            </View>
-          ) : (
-            <Text style={styles.itemText}>Itemized entries will appear here.</Text>
-          )}
-          {ocrError ? <Text style={styles.ocrErrorText}>{ocrError}</Text> : null}
-        </View>
-        <Pressable style={styles.secondaryButton} onPress={handleAddItem}> 
-          <Text style={styles.secondaryButtonText}>Add Item</Text>
-        </Pressable>
-      </View>
-
-      {purchaseDateWarning ? (
-        <View style={styles.warningCard}>
-          <Text style={styles.warningTitle}>Possible duplicate receipt</Text>
-          <Text style={styles.warningText}>
-            A receipt with this purchase date/time already exists. Confirm before saving.
-          </Text>
-          <Pressable
-            style={styles.warningCheckboxRow}
-            onPress={() => setPurchaseDateAcknowledged((prev) => !prev)}
-          >
-            <View
-              style={[
-                styles.warningCheckbox,
-                purchaseDateAcknowledged && styles.warningCheckboxChecked,
-              ]}
-            >
-              {purchaseDateAcknowledged ? (
-                <Text style={styles.warningCheckboxMark}>✓</Text>
-              ) : null}
-            </View>
-            <Text style={styles.warningCheckboxLabel}>I acknowledge this may be a duplicate</Text>
+                {items.map((item) => (
+                  <View key={item.id} style={styles.tableRow}>
+                    <TextInput
+                      style={[styles.tableCell, styles.tableCellName]}
+                      value={item.name}
+                      onChangeText={(value) => updateItem(item.id, { name: value })}
+                      placeholder="Item name"
+                      placeholderTextColor="#9CA3AF"
+                    />
+                    <TextInput
+                      style={[styles.tableCell, styles.tableCellQty]}
+                      value={item.qty}
+                      onChangeText={(value) => updateItem(item.id, { qty: value })}
+                      placeholder="-"
+                      placeholderTextColor="#9CA3AF"
+                      keyboardType="decimal-pad"
+                    />
+                    <TextInput
+                      style={[styles.tableCell, styles.tableCellPrice]}
+                      value={item.price}
+                      onChangeText={(value) => updateItem(item.id, { price: value })}
+                      placeholder="0.00"
+                      placeholderTextColor="#9CA3AF"
+                      keyboardType="decimal-pad"
+                    />
+                    <TextInput
+                      style={[styles.tableCell, styles.tableCellLineTotal]}
+                      value={item.lineTotal}
+                      onChangeText={(value) => updateItem(item.id, { lineTotal: value })}
+                      placeholder="0.00"
+                      placeholderTextColor="#9CA3AF"
+                      keyboardType="decimal-pad"
+                    />
+                  </View>
+                ))}
+              </View>
+            ) : (
+              <Text style={styles.itemText}>Itemized entries will appear here.</Text>
+            )}
+            {ocrError ? <Text style={styles.ocrErrorText}>{ocrError}</Text> : null}
+          </View>
+          <Pressable style={styles.secondaryButton} onPress={handleAddItem}>
+            <Text style={styles.secondaryButtonText}>Add Item</Text>
           </Pressable>
         </View>
-      ) : null}
 
-      <Pressable
-        style={[
-          styles.primaryButton,
-          (isSaving || (purchaseDateWarning && !purchaseDateAcknowledged)) &&
+        {purchaseDateWarning ? (
+          <View style={styles.warningCard}>
+            <Text style={styles.warningTitle}>Possible duplicate receipt</Text>
+            <Text style={styles.warningText}>
+              A receipt with this purchase date/time already exists. Confirm before saving.
+            </Text>
+            <Pressable
+              style={styles.warningCheckboxRow}
+              onPress={() => setPurchaseDateAcknowledged((prev) => !prev)}
+            >
+              <View
+                style={[
+                  styles.warningCheckbox,
+                  purchaseDateAcknowledged && styles.warningCheckboxChecked,
+                ]}
+              >
+                {purchaseDateAcknowledged ? (
+                  <Text style={styles.warningCheckboxMark}>✓</Text>
+                ) : null}
+              </View>
+              <Text style={styles.warningCheckboxLabel}>I acknowledge this may be a duplicate</Text>
+            </Pressable>
+          </View>
+        ) : null}
+
+        <Pressable
+          style={[
+            styles.primaryButton,
+            (isSaving || (purchaseDateWarning && !purchaseDateAcknowledged)) &&
             styles.primaryButtonDisabled,
-        ]}
-        onPress={handleSave}
-        disabled={isSaving || (purchaseDateWarning && !purchaseDateAcknowledged)}
-      >
-        <Text style={styles.primaryButtonText}>
-          {isSaving ? 'Saving...' : 'Save Receipt'}
-        </Text>
-      </Pressable>
+          ]}
+          onPress={handleSave}
+          disabled={isSaving || (purchaseDateWarning && !purchaseDateAcknowledged)}
+        >
+          <Text style={styles.primaryButtonText}>
+            {isSaving ? 'Saving...' : 'Save Receipt'}
+          </Text>
+        </Pressable>
 
         <BrandingFooter />
       </ScrollView>

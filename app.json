@@ -54,7 +54,8 @@
           "photosPermission": "Allow access to your photo library to attach receipt images.",
           "cameraPermission": "Allow access to your camera to capture receipt images."
         }
-      ]
+      ],
+      "expo-secure-store"
     ],
     "experiments": {
       "typedRoutes": true,
